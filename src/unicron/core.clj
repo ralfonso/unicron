@@ -5,113 +5,120 @@
 (defn create-handler
    "creates a handler for http.async.client that accepts a response state (status/headers) and a
    vec of bytes that represents the body checks the status, converts the body to string, and
-   passes it along to the subscribers"
-  [config]
-  (let [user-handler (-> config :handler)]
-    (fn handle-body
-      [state body]
-      (let [status (client/status state)
-            headers (client/headers state)]
-        ; we track different types of disconnects because we have to
-        ; back off in different manners for each
-        (debugf "status: %s" status)
-        (debugf "headers %s" headers)
-        (if status
-          (if (= (:code status) 200)
-            (let [tweet-str (client/string headers body)]
-              (debugf "body: %s" tweet-str)
-              (user-handler status headers body tweet-str))))))))
+   passes it along to the user-defined handler"
+  [user-handler]
+  (fn [state body]
+    (let [status (client/status state)
+          headers (client/headers state)]
+      ; we track different types of disconnects because we have to
+      ; back off in different manners for each
+      (debugf "status: %s" status)
+      (debugf "headers %s" headers)
+      (if status
+        (if (= (:code status) 200)
+          (let [tweet-str (client/string headers body)]
+            (user-handler status headers body tweet-str))))
+      [body :continue])))
 
-
-(defn twitter-stream-connect
-  "creates an HTTP client and attempts to connect to the Streaming API.  Uses an async callback system
-   to handle incoming data.  Returns one of three keywords to the worker loop:
-    :network-error (represents a connection timeout or other TCP error)
-    :http-error (we connected to the host, but received a non-200 HTTP status)
-    :disconnect (this is a normal disconnect, it occurs if the stream is broken, we don't back off for disconnects
-                 of this type)"
-  [handler twitter-api-url auth query]
-  (let [http-client (client/create-client :request-timeout -1
-                                          :connection-timeout 10000
-                                          :keepalive false
-                                          :auth auth)]
-    (try
-      (infof "Connecting to the Twitter Streaming API: %s. Params %s" twitter-api-url query)
-      (let [response (client/await (client/request-stream http-client :get twitter-api-url handler :query query))
-            err (client/error response)
-            status (client/status response)]
-          (if err
-            (do
-              (if (enabled? :debug) (.printStackTrace err))
-              (infof "Connection error: %s" err)
-              :network-error)
-            (if status
-              (if (> (:code status) 200)
-                (do
-                  (infof "Non-200 status received: %s" (:code status))
-                  :http-error)
-                (do
-                  (infof "Disconnected")
-                  :disconnect))
-              ; no status, no error? NETWORK
-              :network-error)))
-    (catch Exception e
-      (infof "Received network error on connect: %s" e)
-      (if (enabled? :debug) (.printStackTrace e))
-      :network-error))))
+(defn dispatch-backoff
+  "controls the sleep/backoff. linearly for network errors and exponentially for HTTP errors/rate limiting
+  returns the number of seconds that we slept"
+  [errors error]
+  (let [error-count (- (-> @errors :counts error) 2)] ; the intervals are zero-indexed, but we only care about errors after the first one
+    (if (>= error-count 0)
+      (let [backoff-interval (deref (-> @errors :intervals error))
+            backoff-in-ms (nth backoff-interval error-count)]
+        (if (> backoff-in-ms 0) ; no backoff for the first error
+          (do
+            (infof "Backoff: sleeping for %sms" backoff-in-ms)
+            (Thread/sleep backoff-in-ms)))))))
 
 (defn handle-error
   "takes a map that represents the current control status (consectutive error counts)
    and the last-received error.  Handles incrementing the counts or resetting them
    if we encounter a legitimate disconnect"
-  [control error]
-  (condp = error
+  [errors current-error]
+  (condp = current-error
     :disconnect
       ; if we get a simple disconnect, that means we had at least one good connection, so reset the control map
-      {:http-error 0 :network-error 0}
-    (update-in control [error] inc)))
+      (swap! errors assoc :counts {:http-error 0 :network-error 0})
+    (do
+      (swap! errors update-in [:counts current-error] inc)
+      (dispatch-backoff errors current-error))))
 
-(defn dispatch-backoff
-  "controls the sleep/backoff. linearly for network errors and exponentially for HTTP errors/rate limiting
-  returns the number of seconds that we slept"
-  [control error backoff-intervals]
-  (let [error-count (- (error control) 2) ; the intervals are zero-indexed, but we only care about errors after the first one
-        backoff-interval (error backoff-intervals)]
-    (nth backoff-interval error-count)))
+(defn twitter-stream-connect
+  "creates an HTTP client and attempts to connect to the Streaming API.  Uses an async callback system to
+   handle the streamed response"
+  [http-client run-control & {:as options}]
+  (let [url (-> options :config :api-url)
+        handler-base (-> options :config :handler)
+        handler (create-handler handler-base)
+        backoff-intervals (-> options :config :backoff :intervals)
+        query (-> options :config :query)]
+    (loop [errors (atom {:intervals backoff-intervals :counts {:http-error 0 :network-error 0}})]
+      (if (= @run-control :stop)
+        (Thread/sleep 1000) ;FIXME: how to do this without using a spinloop?
+        (do
+          (try
+            (infof "Connecting to the Twitter Streaming API: %s. Params %s" url query)
+            (let [resp (client/request-stream http-client :get url handler :query query)]
+              (loop []
+                (if (= @run-control :stop)
+                  (client/cancel resp) ; if someone stopped the worker then cancel the request
+                  (if (client/done? resp)
+                    (let [err (client/error resp)
+                          status (client/status resp)]
+                      (if err
+                        (do
+                          (infof "Connection error: %s" err)
+                          (handle-error errors :network-error))
+                        (if status
+                          (if (not= (:code status) 200)
+                            (do
+                              (infof "Non-200 status received: %s" (:code status))
+                              (handle-error errors :http-error))
+                            (do
+                              (infof "Disconnected")
+                              (handle-error errors :disconnect)))
+                          ; no status, no error? blame the network!
+                          (handle-error errors :network-error))))
+                    (recur)))))
+            (catch Exception e
+              (infof "Received network error on connect: %s" e)
+              (handle-error errors :network-error)))))
+            (recur errors))))
 
-(defn worker
-  "an infinite loop that connects to the Streaming API and hands off tweets to our processor"
-  [config handler]
-  (let [auth {:user (-> config :auth :username)
-              :password (-> config :auth :password)
-              :preemptive true}
-        track-hashtags (apply str (interpose "," (-> config :filters)))
-        backoff-intervals (-> config :backoff :intervals)]
-    (loop [control {:http-error 0
-                    :network-error 0}]
-      ;; twitter-stream-connect blocks until is disconnects, where it will return a keyword
-      ;; specifying the error
-      (let [error (twitter-stream-connect handler (-> config :api-url) auth {:track track-hashtags})
-            loop-control (handle-error control error)
-            backoff-in-ms (dispatch-backoff loop-control error backoff-intervals)]
-        (infof "Error received: %s" error)
-        (if (> backoff-in-ms 0) ; no backoff for the first error
-          (do
-            (infof "Backoff: sleeping for %sms" backoff-in-ms)
-            (Thread/sleep backoff-in-ms)))
-        (recur loop-control)))))
+(defprotocol WorkerBase
+  (start-worker [worker])
+  (stop-worker [worker]))
+
+(defrecord Worker [run-control config client]
+  WorkerBase
+  (start-worker [worker]
+    (reset! (:run-control worker) :start))
+  (stop-worker [worker]
+    (reset! (:run-control worker) :stop)))
 
 (defn default-handler
   [status headers body tweet-string]
-  (infof "Tweet received %s" tweet-string))
+  (infof "Tweet received. len %s" (count tweet-string))
+  [body :continue])
 
 (def default-config
-  {:backoff {:intervals {:network-error (iterate #(min 16000 (+ 250 %)) 250)
-                         :http-error (iterate #(min 320000 (* 2 %)) 5000)}}
+  {:backoff {:intervals {:network-error (delay (iterate #(min 16000 (+ 250 %)) 250))
+                         :http-error (delay (iterate #(min 320000 (* 2 %)) 5000))}}
    :handler default-handler})
 
 (defn create-worker
   [config]
+  ;track-hashtags (if filters (apply str (interpose "," filters)))
   (let [config (merge default-config config)
-        handler (create-handler config)]
-    (worker config handler)))
+        run-control (atom :stop)
+        auth (:auth config)
+        auth (if auth (assoc auth :preemptive true))
+        http-client (client/create-client :request-timeout -1
+                                          :connection-timeout 10000
+                                          :keepalive false
+                                          :auth auth)
+        client (future (twitter-stream-connect http-client run-control :config config))]
+    (Worker. run-control config client)))
