@@ -1,4 +1,4 @@
-(defproject unicron "0.1.0"
+(defproject unicron "0.1.1"
   :description "Library for communicating with the Twitter Streaming API"
   :url "blah" ;FIXME: needs url
   :license {:name "Eclipse Public License" ;FIXME: needs license
