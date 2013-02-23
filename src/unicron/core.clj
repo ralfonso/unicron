@@ -82,7 +82,9 @@
                               (handle-error errors :disconnect)))
                           ; no status, no error? blame the network!
                           (handle-error errors :network-error))))
-                    (recur)))))
+                    (do
+                      (Thread/sleep 1000)
+                      (recur))))))
             (catch Exception e
               (infof "Received network error on connect: %s" e)
               (handle-error errors :network-error)))))
